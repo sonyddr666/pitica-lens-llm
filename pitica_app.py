@@ -24,7 +24,7 @@ from print_lens import (
     image_hash,
     save_clipboard_image,
 )
-from voice_service import TTSManager, VoiceService
+from voice_service import TTSManager, VoiceService, extrair_credenciais, salvar_token_txt
 
 
 APP_CONFIG = Path("app_config.json")
@@ -281,6 +281,7 @@ class PiticaUnifiedApp:
         controls.pack(fill=X, pady=(0, 10))
         ttk.Button(controls, text="Iniciar STT", command=self.start_voice, style="Accent.TButton").pack(side=LEFT)
         ttk.Button(controls, text="Parar STT", command=self.stop_voice).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(controls, text="Importar headers STT", command=self.open_stt_token_importer).pack(side=LEFT, padx=(8, 0))
         self.voice_status = StringVar(value="STT parado.")
         ttk.Label(controls, textvariable=self.voice_status, style="Toolbar.TLabel").pack(side=LEFT, padx=14)
 
@@ -764,6 +765,42 @@ class PiticaUnifiedApp:
             provider=self.tts_provider_var.get().strip() or "edge",
             voice=self.tts_voice_var.get().strip() or "pt-BR-FranciscaNeural",
         )
+
+    def open_stt_token_importer(self) -> None:
+        win = Toplevel(self.root)
+        win.title("Importar headers STT")
+        win.geometry("760x560")
+        win.transient(self.root)
+
+        ttk.Label(
+            win,
+            text="Cole aqui os Request Headers completos do DevTools para /backend-api/transcribe.",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        text_box = scrolledtext.ScrolledText(win, wrap=tk.WORD, height=24)
+        text_box.pack(fill=BOTH, expand=True, padx=12, pady=(0, 8))
+        text_box.configure(background=PANEL_BG, foreground=TEXT_FG, relief=tk.FLAT, borderwidth=0, padx=10, pady=8)
+
+        status = StringVar(value="Precisa conter authorization e cookie.")
+        ttk.Label(win, textvariable=status).pack(anchor="w", padx=12, pady=(0, 8))
+
+        buttons = ttk.Frame(win, padding=(12, 0, 12, 12))
+        buttons.pack(fill=X)
+
+        def save_headers() -> None:
+            raw = text_box.get("1.0", END)
+            data, errors = extrair_credenciais(raw)
+            if errors:
+                status.set(" | ".join(errors))
+                messagebox.showerror("STT", "\n".join(errors))
+                return
+            salvar_token_txt(data, "token.txt")
+            status.set("token.txt salvo. STT pronto para iniciar.")
+            self.voice_status.set("token.txt salvo.")
+            self.log("Credenciais STT importadas para token.txt.")
+
+        ttk.Button(buttons, text="Salvar token.txt", command=save_headers, style="Accent.TButton").pack(side=LEFT)
+        ttk.Button(buttons, text="Fechar", command=win.destroy).pack(side=RIGHT)
 
     def refresh_accounts(self) -> None:
         accounts = self.codex.list_accounts(refresh_cache=True)
