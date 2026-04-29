@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "auto_print": False,
     "lens_enabled": True,
     "send_image_to_llm": True,
+    "stt_mode": "anon",
 }
 
 APP_BG = "#eef2f7"
@@ -125,6 +126,7 @@ class PiticaUnifiedApp:
         self.auto_print_var = BooleanVar(value=bool(self.config.get("auto_print", False)))
         self.lens_enabled_var = BooleanVar(value=bool(self.config.get("lens_enabled", True)))
         self.send_image_to_llm_var = BooleanVar(value=bool(self.config.get("send_image_to_llm", True)))
+        self.stt_mode_var = StringVar(value=str(self.config.get("stt_mode", "anon")))
 
         self._build_ui()
         self.refresh_accounts()
@@ -156,6 +158,7 @@ class PiticaUnifiedApp:
                 "auto_print": bool(self.auto_print_var.get()),
                 "lens_enabled": bool(self.lens_enabled_var.get()),
                 "send_image_to_llm": bool(self.send_image_to_llm_var.get()),
+                "stt_mode": self.stt_mode_var.get().strip() or "anon",
             }
         )
         APP_CONFIG.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -281,6 +284,8 @@ class PiticaUnifiedApp:
         controls.pack(fill=X, pady=(0, 10))
         ttk.Button(controls, text="Iniciar STT", command=self.start_voice, style="Accent.TButton").pack(side=LEFT)
         ttk.Button(controls, text="Parar STT", command=self.stop_voice).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(controls, text="Modo", style="Toolbar.TLabel").pack(side=LEFT, padx=(12, 4))
+        ttk.Combobox(controls, textvariable=self.stt_mode_var, values=["anon", "token"], width=8, state="readonly").pack(side=LEFT)
         ttk.Button(controls, text="Importar headers STT", command=self.open_stt_token_importer).pack(side=LEFT, padx=(8, 0))
         self.voice_status = StringVar(value="STT parado.")
         ttk.Label(controls, textvariable=self.voice_status, style="Toolbar.TLabel").pack(side=LEFT, padx=14)
@@ -740,6 +745,7 @@ class PiticaUnifiedApp:
             return
         self.apply_tts_config()
         self.voice_service = VoiceService(
+            mode=self.stt_mode_var.get().strip() or "anon",
             pause_event=self.tts.speaking_event,
             on_transcript=lambda text: self.post("voice_transcript", text),
             on_status=lambda message: self.post("voice_status", message),

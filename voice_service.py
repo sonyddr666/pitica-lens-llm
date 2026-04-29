@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -15,7 +16,7 @@ import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import sounddevice as sd
 from curl_cffi import requests as cf_requests
@@ -23,6 +24,7 @@ from curl_cffi import requests as cf_requests
 
 TOKEN_FILE = "token.txt"
 TRANSCRIBE_URL = "https://chatgpt.com/backend-api/transcribe"
+ANON_TRANSCRIBE_URL = "https://chatgpt.com/backend-anon/transcribe"
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -149,13 +151,43 @@ def salvar_wav(frames: list[bytes]) -> tuple[str, int]:
     return temp_path, duration_ms
 
 
-def montar_body(audio_path: str, duration_ms: int) -> tuple[bytes, str]:
+def converter_wav_para_webm(wav_path: str) -> str:
+    webm_path = tempfile.NamedTemporaryFile(delete=False, suffix=".webm").name
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        wav_path,
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-ac",
+        str(CHANNELS),
+        webm_path,
+    ]
+    subprocess.run(cmd, check=True)
+    return webm_path
+
+
+def montar_body(audio_path: str, duration_ms: int, fmt: Literal["wav", "webm"] = "wav") -> tuple[bytes, str]:
     audio_bytes = Path(audio_path).read_bytes()
     boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    if fmt == "webm":
+        filename = "whisper.webm"
+        content_type = "audio/webm;codecs=opus"
+    else:
+        filename = "audio.wav"
+        content_type = "audio/wav"
     body = b""
     body += f"--{boundary}\r\n".encode()
-    body += b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-    body += b"Content-Type: audio/wav\r\n\r\n"
+    body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+    body += f"Content-Type: {content_type}\r\n\r\n".encode()
     body += audio_bytes
     body += f"\r\n--{boundary}\r\n".encode()
     body += b'Content-Disposition: form-data; name="duration_ms"\r\n\r\n'
@@ -204,6 +236,58 @@ def transcrever_arquivo(audio_path: str, duration_ms: int, token_data: dict[str,
         except Exception:
             return response.text.strip(), response.status_code, elapsed_ms, raw
     return f"[Erro {response.status_code}] {response.text[:400]}", response.status_code, elapsed_ms, raw
+
+
+def transcrever_arquivo_anon(
+    audio_path: str,
+    duration_ms: int,
+    *,
+    fmt: Literal["wav", "webm"] = "wav",
+    language: str = "pt-BR",
+    device_id: str | None = None,
+    session_id: str | None = None,
+) -> tuple[str, int, int, str]:
+    send_path = audio_path
+    cleanup_extra: str | None = None
+    if fmt == "webm":
+        send_path = converter_wav_para_webm(audio_path)
+        cleanup_extra = send_path
+
+    try:
+        body, boundary = montar_body(send_path, duration_ms, fmt)
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "oai-device-id": device_id or str(uuid.uuid4()),
+            "oai-session-id": session_id or str(uuid.uuid4()),
+            "oai-language": language,
+            "oai-client-build-number": "6232230",
+            "oai-client-version": "prod-5d86787f9f8d1f6b6e7e021b6aa4d6b14a14445c",
+        }
+
+        start = time.perf_counter()
+        response = cf_requests.post(ANON_TRANSCRIBE_URL, headers=headers, data=body, impersonate="chrome", timeout=120)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        raw = response.text[:1200]
+
+        if response.status_code == 200:
+            try:
+                return limpar_texto_resposta(response.json()), response.status_code, elapsed_ms, raw
+            except Exception:
+                return response.text.strip(), response.status_code, elapsed_ms, raw
+        return f"[Erro {response.status_code}] {response.text[:600]}", response.status_code, elapsed_ms, raw
+    finally:
+        if cleanup_extra and os.path.exists(cleanup_extra):
+            try:
+                os.remove(cleanup_extra)
+            except Exception:
+                pass
 
 
 class TTSManager:
@@ -296,6 +380,9 @@ class VoiceService:
         self,
         *,
         token_file: str | Path = TOKEN_FILE,
+        mode: Literal["anon", "token"] = "anon",
+        audio_format: Literal["wav", "webm"] = "wav",
+        language: str = "pt-BR",
         settings: VoiceSettings | None = None,
         pause_event: threading.Event | None = None,
         on_transcript: Callable[[str], None] | None = None,
@@ -303,6 +390,11 @@ class VoiceService:
         on_level: Callable[[int], None] | None = None,
     ) -> None:
         self.token_file = Path(token_file)
+        self.mode = mode
+        self.audio_format = audio_format
+        self.language = language
+        self.anon_device_id = str(uuid.uuid4())
+        self.anon_session_id = str(uuid.uuid4())
         self.settings = settings or VoiceSettings()
         self.pause_event = pause_event or threading.Event()
         self.on_transcript = on_transcript
@@ -318,9 +410,11 @@ class VoiceService:
     def start(self) -> None:
         if self.running:
             return
-        token_data = carregar_token_txt(self.token_file)
-        if not token_data.get("authorization") or not token_data.get("cookie"):
-            raise RuntimeError(f"Credenciais STT ausentes em {self.token_file}.")
+        token_data: dict[str, str] | None = None
+        if self.mode == "token":
+            token_data = carregar_token_txt(self.token_file)
+            if not token_data.get("authorization") or not token_data.get("cookie"):
+                raise RuntimeError(f"Credenciais STT ausentes em {self.token_file}.")
 
         self.stop_event.clear()
         self.audio_queue = queue.Queue(maxsize=self.settings.audio_queue_size)
@@ -331,7 +425,7 @@ class VoiceService:
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.worker_thread.start()
         self.capture_thread.start()
-        self._status("STT iniciado.")
+        self._status(f"STT iniciado ({self.mode}).")
 
     def stop(self) -> None:
         if not self.running:
@@ -341,7 +435,7 @@ class VoiceService:
         self.running = False
         self._status("STT parando...")
 
-    def _transcription_worker(self, token_data: dict[str, str]) -> None:
+    def _transcription_worker(self, token_data: dict[str, str] | None) -> None:
         while not self.stop_event.is_set() or not self.turn_queue.empty():
             try:
                 turn = self.turn_queue.get(timeout=0.2)
@@ -355,7 +449,19 @@ class VoiceService:
             try:
                 wav_path, duration_ms = salvar_wav(turn.frames)
                 self._status(f"Transcrevendo turno {turn.idx} ({duration_ms}ms)...")
-                text, status, elapsed_ms, _raw = transcrever_arquivo(wav_path, duration_ms, token_data)
+                if self.mode == "token":
+                    if token_data is None:
+                        raise RuntimeError("Token STT ausente.")
+                    text, status, elapsed_ms, _raw = transcrever_arquivo(wav_path, duration_ms, token_data)
+                else:
+                    text, status, elapsed_ms, _raw = transcrever_arquivo_anon(
+                        wav_path,
+                        duration_ms,
+                        fmt=self.audio_format,
+                        language=self.language,
+                        device_id=self.anon_device_id,
+                        session_id=self.anon_session_id,
+                    )
                 if status == 200 and text:
                     self._status(f"STT turno {turn.idx}: {elapsed_ms}ms")
                     if self.on_transcript:
